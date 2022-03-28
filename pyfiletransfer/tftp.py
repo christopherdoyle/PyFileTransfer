@@ -9,15 +9,19 @@ Ref: https://datatracker.ietf.org/doc/html/rfc1350/
 """
 from __future__ import annotations
 
+import logging
 import socket
 import struct
+import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from random import SystemRandom
-from typing import Dict, Type, Optional
+from typing import Dict, Type, Optional, Tuple
 
-BLOCK_SIZE_BYTES = 512
+from .lib.nt import ctrl_cancel_async_io
+
 SYSTEM_RANDOM = SystemRandom()
+logger = logging.getLogger(__name__)
 
 # RFC 764
 NUL = b"\x00"
@@ -30,9 +34,14 @@ VT = b"\x0B"
 FF = b"\x0C"
 
 
-def netascii_encode(s: str) -> bytes:
+def encode_netascii(s: str) -> bytes:
     result = bytes(ord(c) for c in s)
     # TODO CRLF, NUL
+    return result
+
+
+def decode_netascii(data: bytes) -> str:
+    result = "".join(chr(c) for c in data)
     return result
 
 
@@ -78,11 +87,31 @@ class IPacket(ABC):
             raise ValueError(
                 f"Implementation for PackageType {cls.package_type} already exists"
             )
-        _IPACKET_REGISTRY[PacketType.value] = cls
+        _IPACKET_REGISTRY[cls.package_type.value] = cls
 
+    def __str__(self) -> str:
+        if self.__dict__:
+            description = " | ".join(f"{k}={v}" for k, v in self.__dict__.items())
+        else:
+            description = f" at {id(self):#x}"
+        return f"<{self.__class__.__name__} {description}>"
+
+    @classmethod
     @abstractmethod
-    def from_data(self, data: bytes) -> IPacket:
+    def from_data(cls, data: bytes) -> IPacket:
         pass
+
+
+class TfptException(Exception):
+    pass
+
+
+class ProtocolException(TfptException):
+    pass
+
+
+class PacketReadException(TfptException):
+    pass
 
 
 class ReadRequestPacket(IPacket):
@@ -106,13 +135,36 @@ class ReadRequestPacket(IPacket):
         self.filename = filename
         self.mode = mode
 
+    @classmethod
+    def from_data(cls, data: bytes) -> IPacket:
+        remainder = data[2:]
+        null_terminator_index = remainder.index(b"\x00")
+        if null_terminator_index < 0:
+            raise PacketReadException("Packet does not meet expected format")
+        filename_block = remainder[:null_terminator_index]
+
+        remainder = data[null_terminator_index + 1 :]
+        if null_terminator_index < 0:
+            raise PacketReadException("Packet does not meet expected format")
+
+        mode_block = remainder[:null_terminator_index]
+
+        if len(remainder[null_terminator_index:]) > 1:
+            raise PacketReadException("Packet does not meet expected format")
+
+        packet = ReadRequestPacket(
+            decode_netascii(filename_block),
+            TransferMode[decode_netascii(mode_block)],
+        )
+        return packet
+
     def data(self) -> bytes:
         """Encodes the package into a sendable request. The encoding is always in
         netascii.
         """
         opcode = self.package_type.value
-        filename = netascii_encode(self.filename)
-        mode = netascii_encode(self.mode.value)
+        filename = encode_netascii(self.filename)
+        mode = encode_netascii(self.mode.value)
         structure = self.structure.format(
             filename_size=len(filename), mode_size=len(mode)
         )
@@ -124,7 +176,15 @@ class WriteRequestPacket(ReadRequestPacket):
 
 
 class DataPacket(IPacket):
-    package_type: PacketType = PacketType.ACKNOWLEDGEMENT
+    """
+     2 bytes     2 bytes      n bytes
+     ----------------------------------
+    | Opcode |   Block #  |   Data     |
+     ----------------------------------
+    """
+
+    package_type: PacketType = PacketType.DATA
+    max_block_size = 512
 
     def __init__(
         self,
@@ -137,11 +197,31 @@ class DataPacket(IPacket):
         if self.block_number <= 0:
             raise ValueError("block_number must be >= 1")
 
-        if len(self.data) >= 512:
+        if len(self.data) > self.max_block_size:
             raise ValueError("data must be less than 512 bytes")
+
+    @property
+    def end_of_data(self) -> bool:
+        return len(self.data) < self.max_block_size
+
+    @classmethod
+    def from_data(cls, data: bytes) -> IPacket:
+        if len(data) < 4:
+            raise PacketReadException("Unexpected packet length (packet too small)")
+        block_number = int.from_bytes(data[2:4], byteorder="big")
+        data = data[4:]
+        instance = DataPacket(block_number, data)
+        return instance
 
 
 class AckPacket(IPacket):
+    """
+      2 bytes     2 bytes
+     ---------------------
+    | Opcode |   Block #  |
+     ---------------------
+    """
+
     package_type: PacketType = PacketType.ACKNOWLEDGEMENT
 
     def __init__(self, block_number: int) -> None:
@@ -149,25 +229,65 @@ class AckPacket(IPacket):
         if self.block_number <= 0:
             raise ValueError("block_number must be >= 1")
 
+    @classmethod
+    def from_data(cls, data: bytes) -> IPacket:
+        if len(data) != 4:
+            raise PacketReadException("Unexpected packet length")
+        block_number = int.from_bytes(data[2:], byteorder="big")
+        instance = AckPacket(block_number)
+        return instance
+
+    def data(self) -> bytes:
+        result = struct.pack("!hh", self.package_type.value, self.block_number)
+        return result
+
 
 class ErrorPacket(IPacket):
+    """
+     2 bytes     2 bytes      string    1 byte
+     -----------------------------------------
+    | Opcode |  ErrorCode |   ErrMsg   |   0  |
+     -----------------------------------------
+    """
+
+    package_type = PacketType.ERROR
+
     def __init__(self, error_code: int, error_message: str) -> None:
         self.error_code = error_code
         self.error_message = error_message
 
+        try:
+            self.error = ErrorCodes(self.error_code)
+        except ValueError:
+            self.error = None
+
+    @classmethod
+    def from_data(cls, data: bytes) -> IPacket:
+        if data[-1:] != b"\x00":
+            raise PacketReadException("Data packet is not terminated with null byte")
+        opcode, error_code = struct.unpack("!hh", data[:4])
+        # error_code = int.from_bytes(data[2:4], byteorder="big")
+        error_message = decode_netascii(data[4:-1])
+        instance = ErrorPacket(error_code, error_message)
+        return instance
+
 
 class TransferIdentifier:
     MIN = 0
+    USER_MIN = 1024
     MAX = 65535
 
-    def __init__(self, tid: int = None) -> None:
+    def __init__(self, tid: int = None, user_level: bool = True) -> None:
+        self.user_level = user_level
         if tid is None:
             self.tid = self.random_tid()
         else:
             self.tid = tid
 
     def random_tid(self) -> int:
-        return SYSTEM_RANDOM.randint(self.MIN, self.MAX)
+        return SYSTEM_RANDOM.randint(
+            self.USER_MIN if self.user_level else self.MIN, self.MAX
+        )
 
 
 SERVER_TID = TransferIdentifier(69)
@@ -185,11 +305,100 @@ def read_packet(packet: bytes) -> IPacket:
     return instance
 
 
+def read_server_data(
+    sock, server_address, server_port=None, block_number: int = 1
+) -> Tuple[DataPacket, int]:
+    # TODO ctrl-c on Windows still iffy
+    while True:
+        with ctrl_cancel_async_io(sock.fileno()):
+            try:
+                # the Tftp spec implies Datagrab length < 516
+                data, (sender_address, sender_port) = sock.recvfrom(516)
+                logger.debug("Received data from %s:%d", sender_address, sender_port)
+
+                if (sender_address == server_address) and (
+                    server_port is None or server_port == sender_port
+                ):
+                    break
+            except KeyboardInterrupt:
+                logger.error("Keyboard interrupt detected, exiting")
+                raise
+
+    logger.info("Processing server response")
+    packet = read_packet(data)
+
+    if not isinstance(packet, DataPacket):
+        raise ProtocolException(
+            f"Expected {DataPacket.package_type.name}, got {packet.package_type.name}"
+        )
+
+    if packet.block_number < block_number:
+        logger.warning(
+            f"Expected block_number={block_number}, "
+            f"got block_number={packet.block_number}, probably dupe"
+        )
+        return None, sender_port
+    elif packet.block_number > block_number:
+        raise ProtocolException(
+            f"Expected block_number={block_number}, "
+            f"got block_number={packet.block_number}, packet loss detected"
+        )
+
+    return packet, sender_port
+
+
 def read_file(target_ip):
+    logger.info("Initializing socket")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_address = target_ip
     server_tid = SERVER_TID
     source_tid = TransferIdentifier()
+    logger.info("Client TID = %d", source_tid.tid)
     sock.bind(("0.0.0.0", source_tid.tid))
+    logger.info("Sending RRQ")
     rrq = ReadRequestPacket(filename="file.txt", mode=TransferMode.NETASCII)
     sock.sendto(rrq.data(), (server_address, server_tid.tid))
+
+    def handle_data_packet(p, tid):
+        print(p)
+        logger.debug("Sending ACK")
+        ack_packet = AckPacket(p.block_number)
+        sock.sendto(ack_packet.data(), (server_address, tid))
+
+        if p.end_of_data:
+            # dallying is encouraged
+            logger.info("End Of Data detected, closing socket after 1 second")
+            time.sleep(1)
+            sock.close()
+
+    # let there be do-while
+    logger.info("Waiting for response")
+    block_number = 1
+    data_packet, server_port = read_server_data(
+        sock=sock, server_address=server_address, block_number=block_number
+    )
+    handle_data_packet(data_packet, server_port)
+
+    while data_packet is None or not data_packet.end_of_data:
+        block_number += 1
+        data_packet, _ = read_server_data(
+            sock=sock,
+            server_address=server_address,
+            server_port=server_port,
+            block_number=block_number,
+        )
+        if data_packet is None:
+            block_number -= 1
+            continue
+        handle_data_packet(data_packet, server_port)
+
+    logger.info("Program complete")
+
+
+def main():
+    logging.basicConfig(level=logging.DEBUG)
+    read_file("127.0.0.1")
+
+
+if __name__ == "__main__":
+    main()
