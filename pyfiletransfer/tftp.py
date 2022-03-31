@@ -371,61 +371,67 @@ class TftpPacketClient:
         return instance
 
 
-def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
-    if not isinstance(packet, DataPacket):
-        raise ProtocolException(
-            f"Expected {DataPacket.package_type.name}, got {packet.package_type.name}"
-        )
+class TftpClient:
+    def __init__(self, server_ip: str) -> None:
+        self.packet_client = TftpPacketClient(server_ip)
 
-    if packet.block_number < block_number:
-        logger.warning(
-            f"Expected block_number={block_number}, "
-            f"got block_number={packet.block_number}, probably dupe"
-        )
-    elif packet.block_number > block_number:
-        raise ProtocolException(
-            f"Expected block_number={block_number}, "
-            f"got block_number={packet.block_number}, packet loss detected"
-        )
+    def read_file(
+        self, filename: str, mode: TransferMode = TransferMode.NETASCII
+    ) -> None:
+        self.packet_client.connect()
+        rrq = ReadRequestPacket(filename=filename, mode=mode)
+        self.packet_client.send(rrq)
 
-    return packet
+        def handle_data_packet(p):
+            print(p)
+            logger.debug("Sending ACK")
+            ack_packet = AckPacket(p.block_number)
+            self.packet_client.send(ack_packet)
 
+            if p.end_of_data:
+                # dallying is encouraged
+                logger.info("End Of Data detected, closing socket after 1 second")
+                time.sleep(1)
+                self.packet_client.close()
 
-def read_file(target_ip):
-    server = TftpPacketClient(target_ip)
-    server.connect()
-    rrq = ReadRequestPacket(filename="file.txt", mode=TransferMode.NETASCII)
-    server.send(rrq)
+        block_number = 1
+        packet = None
 
-    def handle_data_packet(p):
-        print(p)
-        logger.debug("Sending ACK")
-        ack_packet = AckPacket(p.block_number)
-        server.send(ack_packet)
+        while packet is None or not packet.end_of_data:
+            packet = self.packet_client.receive()
+            packet = self._check_data_packet(packet, block_number)
+            if packet is None:
+                continue
+            handle_data_packet(packet)
+            block_number += 1
 
-        if p.end_of_data:
-            # dallying is encouraged
-            logger.info("End Of Data detected, closing socket after 1 second")
-            time.sleep(1)
-            server.close()
+        logger.info("Program complete")
 
-    block_number = 1
-    packet = None
+    @staticmethod
+    def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
+        if not isinstance(packet, DataPacket):
+            raise ProtocolException(
+                f"Expected {DataPacket.package_type.name}, "
+                f"got {packet.package_type.name}"
+            )
 
-    while packet is None or not packet.end_of_data:
-        packet = server.receive()
-        packet = _check_data_packet(packet, block_number)
-        if packet is None:
-            continue
-        handle_data_packet(packet)
-        block_number += 1
+        if packet.block_number < block_number:
+            logger.warning(
+                f"Expected block_number={block_number}, "
+                f"got block_number={packet.block_number}, probably dupe"
+            )
+        elif packet.block_number > block_number:
+            raise ProtocolException(
+                f"Expected block_number={block_number}, "
+                f"got block_number={packet.block_number}, packet loss detected"
+            )
 
-    logger.info("Program complete")
+        return packet
 
 
 def main():
     UserLogger().add_stderr(logging.DEBUG)
-    read_file("127.0.0.1")
+    TftpClient("127.0.0.1").read_file("file.txt")
 
 
 if __name__ == "__main__":
