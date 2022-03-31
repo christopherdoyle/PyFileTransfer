@@ -300,12 +300,14 @@ class TftpPacketClient:
         self.sock: socket.socket = None
         self.initial_server_port: int = server_port
         self.server_port: int = None
+        self.client_port: int = None
 
     def connect(self) -> None:
         logger.info("Initializing socket")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
-        logger.info("Client TID = %d", self.sock.getsockname()[1])
+        self.client_port: int = self.sock.getsockname()[1]
+        logger.info("Client TID = %d", self.client_port)
 
     def close(self) -> None:
         self.sock.close()

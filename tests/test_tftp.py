@@ -1,6 +1,36 @@
+from __future__ import annotations
+import socket
+import threading
+from enum import Enum
+from queue import Queue
+from typing import Type
+
 import pytest
 
 from pyfiletransfer import tftp
+
+
+class MockPacketType(Enum):
+    MOCK = 9
+
+    @property
+    def implementation(self) -> Type[MockPacket]:
+        return MockPacket
+
+
+class MockPacket(tftp.IPacket):
+
+    package_type = MockPacketType.MOCK
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def data(self) -> bytes:
+        return self._data
+
+    @classmethod
+    def from_data(cls, data: bytes) -> MockPacket:
+        return MockPacket(data)
 
 
 class TestReadRequestPacket:
@@ -135,3 +165,33 @@ class TestErrorPacket:
         assert expected.error_code == actual.error_code
         assert expected.error_message == actual.error_message
         assert expected.error == actual.error
+
+
+class TestTftpPacketClient:
+    def test_send(self) -> None:
+        packet = MockPacket(b"HOT BUTTER")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", 0))
+        server_port = int(sock.getsockname()[1])
+        result_queue = Queue()
+
+        def server(sock: socket.socket, result: Queue) -> None:
+            sock.settimeout(1)
+            message, remote = sock.recvfrom(1024)
+            result.put((message, remote))
+
+        server_thread = threading.Thread(
+            target=server, kwargs=dict(sock=sock, result=result_queue)
+        )
+        server_thread.start()
+
+        client = tftp.TftpPacketClient(server_ip="127.0.0.1", server_port=server_port)
+        client.connect()
+        client.send(packet)
+
+        server_thread.join()
+
+        result = result_queue.get(block=False, timeout=0)
+        assert result is not None
+        assert result[0] == b"HOT BUTTER"
+        assert result[1] == ("127.0.0.1", client.client_port)
