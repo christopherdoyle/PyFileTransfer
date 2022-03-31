@@ -9,19 +9,22 @@ Ref: https://datatracker.ietf.org/doc/html/rfc1350/
 """
 from __future__ import annotations
 
+import io
 import logging
+import pathlib
 import socket
 import struct
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from random import SystemRandom
-from typing import Dict, Type, Optional
+from typing import Dict, Type, Optional, Union
 
 from .lib.nt import ctrl_cancel_async_io
 from .logging import UserLogger
 
 SYSTEM_RANDOM = SystemRandom()
+PATHLIKE = Union[str, pathlib.Path]
 logger = logging.getLogger(__name__)
 
 # RFC 764
@@ -375,37 +378,64 @@ class TftpClient:
     def __init__(self, server_ip: str) -> None:
         self.packet_client = TftpPacketClient(server_ip)
 
-    def read_file(
-        self, filename: str, mode: TransferMode = TransferMode.NETASCII
+    def download_file(
+        self,
+        remote_filename: str,
+        local_filepath: PATHLIKE,
+        mode: TransferMode = TransferMode.NETASCII,
     ) -> None:
+        raise NotImplementedError
+
+    def read_file(
+        self, remote_filename: str, mode: TransferMode = TransferMode.NETASCII
+    ) -> io.StringIO:
+        response_stream = io.StringIO()
+
         self.packet_client.connect()
-        rrq = ReadRequestPacket(filename=filename, mode=mode)
+        rrq = ReadRequestPacket(filename=remote_filename, mode=mode)
         self.packet_client.send(rrq)
 
-        def handle_data_packet(p):
-            print(p)
-            logger.debug("Sending ACK")
-            ack_packet = AckPacket(p.block_number)
-            self.packet_client.send(ack_packet)
-
-            if p.end_of_data:
-                # dallying is encouraged
-                logger.info("End Of Data detected, closing socket after 1 second")
-                time.sleep(1)
-                self.packet_client.close()
-
         block_number = 1
-        packet = None
 
-        while packet is None or not packet.end_of_data:
+        while True:
             packet = self.packet_client.receive()
             packet = self._check_data_packet(packet, block_number)
             if packet is None:
                 continue
-            handle_data_packet(packet)
+
+            response_stream.write(decode_netascii(packet.raw_data))
+            logger.debug("Sending ACK")
+            self.packet_client.send(AckPacket(packet.block_number))
+
+            if packet.end_of_data:
+                # dallying is encouraged
+                logger.info("End Of Data detected, closing socket after 1 second")
+                time.sleep(1)
+                self.packet_client.close()
+                break
+
             block_number += 1
 
-        logger.info("Program complete")
+        logger.info("Read file complete")
+
+        response_stream.seek(0)
+        return response_stream
+
+    def upload_file(
+        self,
+        remote_filename: str,
+        local_filepath: PATHLIKE,
+        mode: TransferMode = TransferMode.NETASCII,
+    ) -> None:
+        raise NotImplementedError
+
+    def write_file(
+        self,
+        remote_filename: str,
+        data: Union[str, io.StringIO],
+        mode: TransferMode = TransferMode.NETASCII,
+    ) -> None:
+        raise NotImplementedError
 
     @staticmethod
     def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
@@ -431,7 +461,7 @@ class TftpClient:
 
 def main():
     UserLogger().add_stderr(logging.DEBUG)
-    TftpClient("127.0.0.1").read_file("file.txt")
+    print(TftpClient("127.0.0.1").read_file("file.txt").read())
 
 
 if __name__ == "__main__":
