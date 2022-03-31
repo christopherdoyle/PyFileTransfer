@@ -70,7 +70,7 @@ class TestDataPacket:
         )
         actual = tftp.DataPacket.from_data(data)
         assert expected.block_number == actual.block_number
-        assert expected.data == actual.data
+        assert expected.raw_data == actual.raw_data
 
     def test_data(self) -> None:
         expected = (
@@ -111,7 +111,7 @@ class TestErrorPacket:
     def test_data(self) -> None:
         expected = (
             # opcode
-            b"\x00\x00"
+            b"\x00\x05"
             # error code - Unknown transfer ID
             b"\x00\x05"
             # error message
@@ -124,7 +124,7 @@ class TestErrorPacket:
     def test_from_data(self) -> None:
         data = (
             # opcode
-            b"\x00\x00"
+            b"\x00\x05"
             # error code - Unknown transfer ID
             b"\x00\x05"
             # error message

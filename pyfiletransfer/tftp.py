@@ -96,10 +96,14 @@ class IPacket(ABC):
             description = f" at {id(self):#x}"
         return f"<{self.__class__.__name__} {description}>"
 
+    @abstractmethod
+    def data(self) -> bytes:
+        """Serialize the instance to bytes matching the packet format."""
+
     @classmethod
     @abstractmethod
     def from_data(cls, data: bytes) -> IPacket:
-        pass
+        """Deserialize the instance from bytes."""
 
 
 class TfptException(Exception):
@@ -193,17 +197,22 @@ class DataPacket(IPacket):
         data: bytes,
     ) -> None:
         self.block_number = block_number
-        self.data = data
+        self.raw_data = data
 
         if self.block_number <= 0:
             raise ValueError("block_number must be >= 1")
 
-        if len(self.data) > self.max_block_size:
+        if len(self.raw_data) > self.max_block_size:
             raise ValueError("data must be less than 512 bytes")
 
     @property
     def end_of_data(self) -> bool:
-        return len(self.data) < self.max_block_size
+        return len(self.raw_data) < self.max_block_size
+
+    def data(self) -> bytes:
+        result = struct.pack("!hh", self.package_type.value, self.block_number)
+        result += self.raw_data
+        return result
 
     @classmethod
     def from_data(cls, data: bytes) -> DataPacket:
@@ -252,6 +261,7 @@ class ErrorPacket(IPacket):
     """
 
     package_type = PacketType.ERROR
+    structure = "!hh{error_message_size:d}sc"
 
     def __init__(self, error_code: int, error_message: str) -> None:
         self.error_code = error_code
@@ -261,6 +271,12 @@ class ErrorPacket(IPacket):
             self.error = ErrorCodes(self.error_code)
         except ValueError:
             self.error = None
+
+    def data(self) -> bytes:
+        opcode = self.package_type.value
+        error_message = encode_netascii(self.error_message)
+        structure = self.structure.format(error_message_size=len(error_message))
+        return struct.pack(structure, opcode, self.error_code, error_message, NUL)
 
     @classmethod
     def from_data(cls, data: bytes) -> ErrorPacket:
