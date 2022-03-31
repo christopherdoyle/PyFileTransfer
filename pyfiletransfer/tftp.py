@@ -19,6 +19,7 @@ from random import SystemRandom
 from typing import Dict, Type, Optional, Tuple
 
 from .lib.nt import ctrl_cancel_async_io
+from .logging import UserLogger
 
 SYSTEM_RANDOM = SystemRandom()
 logger = logging.getLogger(__name__)
@@ -413,7 +414,7 @@ def read_file(target_ip):
 
 
 def main():
-    logging.basicConfig(level=logging.DEBUG)
+    UserLogger().add_stderr(logging.DEBUG)
     read_file("127.0.0.1")
 
 
