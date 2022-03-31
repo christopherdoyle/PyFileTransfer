@@ -136,14 +136,15 @@ class ReadRequestPacket(IPacket):
         self.mode = mode
 
     @classmethod
-    def from_data(cls, data: bytes) -> IPacket:
+    def from_data(cls, data: bytes) -> ReadRequestPacket:
         remainder = data[2:]
         null_terminator_index = remainder.index(b"\x00")
         if null_terminator_index < 0:
             raise PacketReadException("Packet does not meet expected format")
         filename_block = remainder[:null_terminator_index]
 
-        remainder = data[null_terminator_index + 1 :]
+        remainder = remainder[null_terminator_index + 1 :]
+        null_terminator_index = remainder.index(b"\x00")
         if null_terminator_index < 0:
             raise PacketReadException("Packet does not meet expected format")
 
@@ -154,7 +155,7 @@ class ReadRequestPacket(IPacket):
 
         packet = ReadRequestPacket(
             decode_netascii(filename_block),
-            TransferMode[decode_netascii(mode_block)],
+            TransferMode[decode_netascii(mode_block).upper()],
         )
         return packet
 
@@ -205,7 +206,7 @@ class DataPacket(IPacket):
         return len(self.data) < self.max_block_size
 
     @classmethod
-    def from_data(cls, data: bytes) -> IPacket:
+    def from_data(cls, data: bytes) -> DataPacket:
         if len(data) < 4:
             raise PacketReadException("Unexpected packet length (packet too small)")
         block_number = int.from_bytes(data[2:4], byteorder="big")
@@ -230,7 +231,7 @@ class AckPacket(IPacket):
             raise ValueError("block_number must be >= 1")
 
     @classmethod
-    def from_data(cls, data: bytes) -> IPacket:
+    def from_data(cls, data: bytes) -> AckPacket:
         if len(data) != 4:
             raise PacketReadException("Unexpected packet length")
         block_number = int.from_bytes(data[2:], byteorder="big")
@@ -262,7 +263,7 @@ class ErrorPacket(IPacket):
             self.error = None
 
     @classmethod
-    def from_data(cls, data: bytes) -> IPacket:
+    def from_data(cls, data: bytes) -> ErrorPacket:
         if data[-1:] != b"\x00":
             raise PacketReadException("Data packet is not terminated with null byte")
         opcode, error_code = struct.unpack("!hh", data[:4])
