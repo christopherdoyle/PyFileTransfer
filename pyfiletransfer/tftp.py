@@ -20,8 +20,8 @@ from enum import Enum
 from random import SystemRandom
 from typing import Dict, Type, Optional, Union
 
-from .lib.nt import ctrl_cancel_async_io
-from .logging import UserLogger
+from .util.logging import UserLogger
+from .util.nt import ctrl_cancel_async_io
 
 SYSTEM_RANDOM = SystemRandom()
 PATHLIKE = Union[str, pathlib.Path]
