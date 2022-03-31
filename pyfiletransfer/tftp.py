@@ -293,33 +293,13 @@ class ErrorPacket(IPacket):
         return instance
 
 
-class TransferIdentifier:
-    MIN = 0
-    USER_MIN = 1024
-    MAX = 65535
-
-    def __init__(self, tid: int = None, user_level: bool = True) -> None:
-        self.user_level = user_level
-        if tid is None:
-            self.tid = self.random_tid()
-        else:
-            self.tid = tid
-
-    def random_tid(self) -> int:
-        return SYSTEM_RANDOM.randint(
-            self.USER_MIN if self.user_level else self.MIN, self.MAX
-        )
-
-
-SERVER_TID = TransferIdentifier(69)
-
-
 class TftpPacketClient:
-    def __init__(self, server_ip: str) -> None:
+    def __init__(self, server_ip: str, server_port: int = 69) -> None:
         # TODO mixin logger w/ classname & connection details
         self.server_ip = server_ip
         self.sock: socket.socket = None
-        self.server_tid: TransferIdentifier = None
+        self.initial_server_port: int = server_port
+        self.server_port: int = None
 
     def connect(self) -> None:
         logger.info("Initializing socket")
@@ -339,16 +319,16 @@ class TftpPacketClient:
                     data, (sender_ip, sender_port) = self.sock.recvfrom(516)
                     logger.debug("Received data from %s:%d", sender_ip, sender_port)
 
-                    if (sender_ip == self.server_ip) and (
-                        self.server_tid is None or self.server_tid.tid == sender_port
-                    ):
-                        break
+                    if sender_ip == self.server_ip:
+                        if self.server_port is None:
+                            self.server_port = sender_port
+                            break
+                        elif self.server_port == sender_port:
+                            break
+
                 except KeyboardInterrupt:
                     logger.error("Keyboard interrupt detected, exiting")
                     raise
-
-        if self.server_tid is None:
-            self.server_tid = TransferIdentifier(sender_port)
 
         logger.info("Processing server response")
         packet = self.read_packet(data)
@@ -356,7 +336,8 @@ class TftpPacketClient:
 
     def send(self, packet: IPacket) -> None:
         self.sock.sendto(
-            packet.data(), (self.server_ip, (self.server_tid or SERVER_TID).tid)
+            packet.data(),
+            (self.server_ip, (self.server_port or self.initial_server_port)),
         )
 
     @staticmethod
