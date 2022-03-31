@@ -16,7 +16,7 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from random import SystemRandom
-from typing import Dict, Type, Optional, Tuple
+from typing import Dict, Type, Optional
 
 from .lib.nt import ctrl_cancel_async_io
 from .logging import UserLogger
@@ -311,40 +311,67 @@ class TransferIdentifier:
 SERVER_TID = TransferIdentifier(69)
 
 
-def read_packet(packet: bytes) -> IPacket:
-    opcode_bytes = packet[:2]
-    opcode_int = int.from_bytes(opcode_bytes, "big")
-    package_type = PacketType(opcode_int)
-    package_class = package_type.implementation
-    if package_class is None:
-        raise ValueError(f"No implementation found for {package_type}")
+class TftpPacketClient:
+    def __init__(self, server_ip: str) -> None:
+        # TODO mixin logger w/ classname & connection details
+        self.server_ip = server_ip
+        self.sock: socket.socket = None
+        self.server_tid: TransferIdentifier = None
+        self.client_tid: TransferIdentifier = None
 
-    instance = package_class.from_data(packet)
-    return instance
+    def connect(self) -> None:
+        self.client_tid = TransferIdentifier()
+        logger.info("Client TID = %d", self.client_tid.tid)
+        logger.info("Initializing socket")
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("0.0.0.0", self.client_tid.tid))
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def receive(self) -> IPacket:
+        # TODO ctrl-c on Windows still iffy
+        while True:
+            with ctrl_cancel_async_io(self.sock.fileno()):
+                try:
+                    # the Tftp spec implies Datagrab length < 516
+                    data, (sender_ip, sender_port) = self.sock.recvfrom(516)
+                    logger.debug("Received data from %s:%d", sender_ip, sender_port)
+
+                    if (sender_ip == self.server_ip) and (
+                        self.server_tid is None or self.server_tid.tid == sender_port
+                    ):
+                        break
+                except KeyboardInterrupt:
+                    logger.error("Keyboard interrupt detected, exiting")
+                    raise
+
+        if self.server_tid is None:
+            self.server_tid = TransferIdentifier(sender_port)
+
+        logger.info("Processing server response")
+        packet = self.read_packet(data)
+        return packet
+
+    def send(self, packet: IPacket) -> None:
+        self.sock.sendto(
+            packet.data(), (self.server_ip, (self.server_tid or SERVER_TID).tid)
+        )
+
+    @staticmethod
+    def read_packet(packet: bytes) -> IPacket:
+        opcode_bytes = packet[:2]
+        opcode_int = int.from_bytes(opcode_bytes, "big")
+        package_type = PacketType(opcode_int)
+        package_class = package_type.implementation
+        if package_class is None:
+            raise ValueError(f"No implementation found for {package_type}")
+
+        instance = package_class.from_data(packet)
+        return instance
 
 
-def read_server_data(
-    sock, server_address, server_port=None, block_number: int = 1
-) -> Tuple[DataPacket, int]:
-    # TODO ctrl-c on Windows still iffy
-    while True:
-        with ctrl_cancel_async_io(sock.fileno()):
-            try:
-                # the Tftp spec implies Datagrab length < 516
-                data, (sender_address, sender_port) = sock.recvfrom(516)
-                logger.debug("Received data from %s:%d", sender_address, sender_port)
-
-                if (sender_address == server_address) and (
-                    server_port is None or server_port == sender_port
-                ):
-                    break
-            except KeyboardInterrupt:
-                logger.error("Keyboard interrupt detected, exiting")
-                raise
-
-    logger.info("Processing server response")
-    packet = read_packet(data)
-
+def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
     if not isinstance(packet, DataPacket):
         raise ProtocolException(
             f"Expected {DataPacket.package_type.name}, got {packet.package_type.name}"
@@ -355,60 +382,43 @@ def read_server_data(
             f"Expected block_number={block_number}, "
             f"got block_number={packet.block_number}, probably dupe"
         )
-        return None, sender_port
     elif packet.block_number > block_number:
         raise ProtocolException(
             f"Expected block_number={block_number}, "
             f"got block_number={packet.block_number}, packet loss detected"
         )
 
-    return packet, sender_port
+    return packet
 
 
 def read_file(target_ip):
-    logger.info("Initializing socket")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_address = target_ip
-    server_tid = SERVER_TID
-    source_tid = TransferIdentifier()
-    logger.info("Client TID = %d", source_tid.tid)
-    sock.bind(("0.0.0.0", source_tid.tid))
-    logger.info("Sending RRQ")
+    server = TftpPacketClient(target_ip)
+    server.connect()
     rrq = ReadRequestPacket(filename="file.txt", mode=TransferMode.NETASCII)
-    sock.sendto(rrq.data(), (server_address, server_tid.tid))
+    server.send(rrq)
 
-    def handle_data_packet(p, tid):
+    def handle_data_packet(p):
         print(p)
         logger.debug("Sending ACK")
         ack_packet = AckPacket(p.block_number)
-        sock.sendto(ack_packet.data(), (server_address, tid))
+        server.send(ack_packet)
 
         if p.end_of_data:
             # dallying is encouraged
             logger.info("End Of Data detected, closing socket after 1 second")
             time.sleep(1)
-            sock.close()
+            server.close()
 
-    # let there be do-while
-    logger.info("Waiting for response")
     block_number = 1
-    data_packet, server_port = read_server_data(
-        sock=sock, server_address=server_address, block_number=block_number
-    )
-    handle_data_packet(data_packet, server_port)
+    packet = None
 
-    while data_packet is None or not data_packet.end_of_data:
-        block_number += 1
-        data_packet, _ = read_server_data(
-            sock=sock,
-            server_address=server_address,
-            server_port=server_port,
-            block_number=block_number,
-        )
-        if data_packet is None:
-            block_number -= 1
+    while packet is None or not packet.end_of_data:
+        packet = server.receive()
+        packet = _check_data_packet(packet, block_number)
+        if packet is None:
             continue
-        handle_data_packet(data_packet, server_port)
+        handle_data_packet(packet)
+        block_number += 1
 
     logger.info("Program complete")
 
