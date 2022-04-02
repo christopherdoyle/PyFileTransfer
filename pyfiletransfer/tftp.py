@@ -16,6 +16,7 @@ import struct
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
+from functools import partial
 from typing import Dict, Type, Optional, Union, Iterator
 
 from .util.func import identity
@@ -430,46 +431,11 @@ class TftpClient:
             raise NotImplementedError
 
         fh = None
-        data_packet = None
         try:
             fh = open(local_filepath, mode="r" + file_mode)
-            self.packet_client.connect()
-            wrq = WriteRequestPacket(filename=remote_filename, mode=mode)
-            self.packet_client.send(wrq)
-
-            # first response should be Ack with block number 0
-            block_number = 0
-            while True:
-                packet = self.packet_client.receive()
-                if isinstance(packet, AckPacket):
-                    if packet.block_number != block_number:
-                        raise ValueError(
-                            f"Ack received with block_number {packet.block_number}, "
-                            f"expected {block_number}"
-                        )
-                elif isinstance(packet, ErrorPacket):
-                    raise ProtocolException(
-                        f"[{packet.error_code}] {packet.error_message}"
-                    )
-                else:
-                    raise ProtocolException(
-                        f"Expected Ack or Err, received {packet.package_type.name}"
-                    )
-
-                if data_packet is not None and data_packet.end_of_data:
-                    # we already sent a data packet < 512, and have received ACK
-                    break
-
-                chunk = fh.read(512)
-                block_number += 1
-                if not chunk:
-                    # last data packet was 512 exactly, and also EOF, so send a 0 sized
-                    # data packet so server knows it is end of data
-                    data_packet = DataPacket(block_number, b"")
-                else:
-                    data_packet = DataPacket(block_number, encode(chunk))
-
-                self.packet_client.send(data_packet)
+            self._write(
+                remote_filename, map(encode, iter(partial(fh.read, 512), b"")), mode
+            )
         finally:
             if fh is not None:
                 fh.close()
@@ -477,10 +443,29 @@ class TftpClient:
     def write_file(
         self,
         remote_filename: str,
-        data: Union[str, io.StringIO],
+        data: Union[str, bytes, io.IOBase],
         mode: TransferMode = TransferMode.NETASCII,
     ) -> None:
-        raise NotImplementedError
+        if mode is TransferMode.NETASCII:
+            pass
+        elif mode is TransferMode.OCTET:
+            pass
+        else:
+            raise NotImplementedError
+
+        if isinstance(data, str):
+            data = io.StringIO(data)
+        elif isinstance(data, bytes):
+            data = io.BytesIO(data)
+
+        if isinstance(data, io.StringIO):
+            encode = encode_netascii
+        else:
+            encode = identity
+
+        self._write(
+            remote_filename, map(encode, iter(partial(data.read, 512), b"")), mode
+        )
 
     def _read(
         self, remote_filename: str, mode: TransferMode = TransferMode.NETASCII
@@ -512,6 +497,49 @@ class TftpClient:
 
         logger.info("Read file complete")
 
+    def _write(
+        self,
+        remote_filename: str,
+        input_data: Iterator[bytes],
+        mode: TransferMode = TransferMode.NETASCII,
+    ) -> None:
+        self.packet_client.connect()
+        wrq = WriteRequestPacket(filename=remote_filename, mode=mode)
+        self.packet_client.send(wrq)
+
+        # first response should be Ack with block number 0
+        block_number = 0
+        data_packet = None
+        while True:
+            packet = self.packet_client.receive()
+            if isinstance(packet, AckPacket):
+                if packet.block_number != block_number:
+                    raise ValueError(
+                        f"Ack received with block_number {packet.block_number}, "
+                        f"expected {block_number}"
+                    )
+            elif isinstance(packet, ErrorPacket):
+                raise ProtocolException(f"[{packet.error_code}] {packet.error_message}")
+            else:
+                raise ProtocolException(
+                    f"Expected Ack or Err, received {packet.package_type.name}"
+                )
+
+            if data_packet is not None and data_packet.end_of_data:
+                # we already sent a data packet < 512, and have received ACK
+                break
+
+            chunk = next(input_data)
+            block_number += 1
+            if not chunk:
+                # last data packet was 512 exactly, and also EOF, so send a 0 sized
+                # data packet so server knows it is end of data
+                data_packet = DataPacket(block_number, b"")
+            else:
+                data_packet = DataPacket(block_number, chunk)
+
+            self.packet_client.send(data_packet)
+
     @staticmethod
     def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
         if not isinstance(packet, DataPacket):
@@ -536,9 +564,14 @@ class TftpClient:
 
 def main():
     UserLogger().add_stderr(logging.DEBUG)
-    print(TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read())
+    # print(
+    #     TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read()
+    # )
     TftpClient("127.0.0.1").upload_file(
         "file2.txt", "file.txt", mode=TransferMode.OCTET
+    )
+    TftpClient("127.0.0.1").write_file(
+        "file3.txt", "Hey World, Where You Goin", mode=TransferMode.NETASCII
     )
 
 
