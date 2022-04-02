@@ -238,8 +238,8 @@ class AckPacket(IPacket):
 
     def __init__(self, block_number: int) -> None:
         self.block_number = block_number
-        if self.block_number <= 0:
-            raise ValueError("block_number must be >= 1")
+        if self.block_number < 0:
+            raise ValueError("block_number must be >= 0")
 
     @classmethod
     def from_data(cls, data: bytes) -> AckPacket:
@@ -385,13 +385,14 @@ class TftpClient:
             # existence then opening with W b/c race conditions
             file_mode = "x" + file_mode
 
-        fh = local_filepath.open(mode=file_mode)
-
+        fh = None
         try:
+            fh = local_filepath.open(mode=file_mode)
             for packet in self._read(remote_filename=remote_filename, mode=mode):
                 fh.write(decode(packet.raw_data))
         finally:
-            fh.close()
+            if fh is not None:
+                fh.close()
 
     def read_file(
         self, remote_filename: str, mode: TransferMode = TransferMode.NETASCII
@@ -419,7 +420,59 @@ class TftpClient:
         local_filepath: PathLike,
         mode: TransferMode = TransferMode.NETASCII,
     ) -> None:
-        raise NotImplementedError
+        if mode is TransferMode.NETASCII:
+            file_mode = "t"
+            encode = encode_netascii
+        elif mode is TransferMode.OCTET:
+            file_mode = "b"
+            encode = identity
+        else:
+            raise NotImplementedError
+
+        fh = None
+        data_packet = None
+        try:
+            fh = open(local_filepath, mode="r" + file_mode)
+            self.packet_client.connect()
+            wrq = WriteRequestPacket(filename=remote_filename, mode=mode)
+            self.packet_client.send(wrq)
+
+            # first response should be Ack with block number 0
+            block_number = 0
+            while True:
+                packet = self.packet_client.receive()
+                if isinstance(packet, AckPacket):
+                    if packet.block_number != block_number:
+                        raise ValueError(
+                            f"Ack received with block_number {packet.block_number}, "
+                            f"expected {block_number}"
+                        )
+                elif isinstance(packet, ErrorPacket):
+                    raise ProtocolException(
+                        f"[{packet.error_code}] {packet.error_message}"
+                    )
+                else:
+                    raise ProtocolException(
+                        f"Expected Ack or Err, received {packet.package_type.name}"
+                    )
+
+                if data_packet is not None and data_packet.end_of_data:
+                    # we already sent a data packet < 512, and have received ACK
+                    break
+
+                chunk = fh.read(512)
+                block_number += 1
+                if not chunk:
+                    # last data packet was 512 exactly, and also EOF, so send a 0 sized
+                    # data packet so server knows it is end of data
+                    data_packet = DataPacket(block_number, b"")
+                else:
+                    data_packet = DataPacket(block_number, encode(chunk))
+
+                self.packet_client.send(data_packet)
+        finally:
+            if fh is not None:
+                fh.close()
 
     def write_file(
         self,
@@ -484,8 +537,8 @@ class TftpClient:
 def main():
     UserLogger().add_stderr(logging.DEBUG)
     print(TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read())
-    TftpClient("127.0.0.1").download_file(
-        "file.txt", "file.txt", mode=TransferMode.OCTET
+    TftpClient("127.0.0.1").upload_file(
+        "file2.txt", "file.txt", mode=TransferMode.OCTET
     )
 
 
