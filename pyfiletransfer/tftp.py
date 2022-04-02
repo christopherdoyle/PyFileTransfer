@@ -16,14 +16,12 @@ import struct
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from random import SystemRandom
 from typing import Dict, Type, Optional, Union, Iterator
 
 from .util.logging import UserLogger
 from .util.io import PathLike, to_path
 from .util.nt import ctrl_cancel_async_io
 
-SYSTEM_RANDOM = SystemRandom()
 logger = logging.getLogger(__name__)
 
 # RFC 764
