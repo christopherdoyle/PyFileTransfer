@@ -562,17 +562,60 @@ class TftpClient:
         return packet
 
 
+class TftpServer:
+    def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
+        self.listen_addr = listen_addr
+        self.listen_port = listen_port
+        self.running = False
+        self.sock = None
+
+    def start(self) -> None:
+        self.running = True
+
+        logger.info("Initializing socket")
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.listen_addr, self.listen_port))
+
+        # TODO handle multiple clients simulataneously --- sepearate state machines
+
+        while self.running:
+            # TODO generalize with TftpPacketClient
+            with ctrl_cancel_async_io(self.sock.fileno()):
+                try:
+                    data, (client_ip, client_port) = self.sock.recvfrom(516)
+                    logger.debug("Received data from %s:%d", client_ip, client_port)
+                except KeyboardInterrupt:
+                    logger.error("Keyboard interrupt detected, exiting")
+                    raise
+
+            logger.info("Processing server response")
+            packet = TftpPacketClient.read_packet(data)
+
+            if isinstance(packet, ReadRequestPacket):
+                pass
+            elif isinstance(packet, WriteRequestPacket):
+                pass
+            else:
+                raise
+
+            self.sock.sendto(AckPacket(0).data(), (client_ip, client_port))
+
+    def stop(self) -> None:
+        self.running = False
+        self.sock.close()
+
+
 def main():
     UserLogger().add_stderr(logging.DEBUG)
     # print(
     #     TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read()
     # )
-    TftpClient("127.0.0.1").upload_file(
-        "file2.txt", "file.txt", mode=TransferMode.OCTET
-    )
-    TftpClient("127.0.0.1").write_file(
-        "file3.txt", "Hey World, Where You Goin", mode=TransferMode.NETASCII
-    )
+    # TftpClient("127.0.0.1").upload_file(
+    #     "file2.txt", "file.txt", mode=TransferMode.OCTET
+    # )
+    # TftpClient("127.0.0.1").write_file(
+    #     "file3.txt", "Hey World, Where You Goin", mode=TransferMode.NETASCII
+    # )
 
 
 if __name__ == "__main__":
