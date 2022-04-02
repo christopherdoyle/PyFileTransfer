@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Type, Optional, Union, Iterator
 
+from .util.func import identity
 from .util.logging import UserLogger
 from .util.io import PathLike, to_path
 from .util.nt import ctrl_cancel_async_io
@@ -363,29 +364,52 @@ class TftpClient:
         mode: TransferMode = TransferMode.NETASCII,
         overwrite: bool = False,
     ) -> None:
+        if mode is TransferMode.NETASCII:
+            file_mode = "t"
+            decode = decode_netascii
+        elif mode is TransferMode.OCTET:
+            file_mode = "b"
+            decode = identity
+        else:
+            raise ValueError(
+                "TransferMode for read requests must be NETASCII or OCTET; "
+                "MAIL mode is only supported for write requests."
+            )
+
         local_filepath = to_path(local_filepath)
 
         if overwrite:
-            file_mode = "w"
+            file_mode = "w" + file_mode
         else:
             # raises is file already exists, this is better than checking file
             # existence then opening with W b/c race conditions
-            file_mode = "x"
+            file_mode = "x" + file_mode
 
         fh = local_filepath.open(mode=file_mode)
 
         try:
             for packet in self._read(remote_filename=remote_filename, mode=mode):
-                fh.write(decode_netascii(packet.raw_data))
+                fh.write(decode(packet.raw_data))
         finally:
             fh.close()
 
     def read_file(
         self, remote_filename: str, mode: TransferMode = TransferMode.NETASCII
-    ) -> io.StringIO:
-        response_stream = io.StringIO()
+    ) -> io.IOBase:
+        if mode is TransferMode.NETASCII:
+            response_stream = io.StringIO()
+            decode = decode_netascii
+        elif mode is TransferMode.OCTET:
+            response_stream = io.BytesIO()
+            decode = identity
+        else:
+            raise ValueError(
+                "TransferMode for read requests must be NETASCII or OCTET; "
+                "MAIL mode is only supported for write requests."
+            )
+
         for packet in self._read(remote_filename=remote_filename, mode=mode):
-            response_stream.write(decode_netascii(packet.raw_data))
+            response_stream.write(decode(packet.raw_data))
         response_stream.seek(0)
         return response_stream
 
@@ -459,8 +483,10 @@ class TftpClient:
 
 def main():
     UserLogger().add_stderr(logging.DEBUG)
-    print(TftpClient("127.0.0.1").read_file("file.txt").read())
-    TftpClient("127.0.0.1").download_file("file.txt", "file.txt")
+    print(TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read())
+    TftpClient("127.0.0.1").download_file(
+        "file.txt", "file.txt", mode=TransferMode.OCTET
+    )
 
 
 if __name__ == "__main__":
