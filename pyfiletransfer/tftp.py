@@ -12,12 +12,13 @@ from __future__ import annotations
 import io
 import logging
 import socket
+import socketserver
 import struct
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import partial
-from typing import Dict, Type, Optional, Union, Iterator
+from typing import Dict, Type, Optional, Union, Iterator, Tuple
 
 from .util.func import identity
 from .util.logging import UserLogger
@@ -83,14 +84,14 @@ _IPACKET_REGISTRY: Dict[int, Type[IPacket]] = {}
 class IPacket(ABC):
     """See Section 5 of RFC 1350."""
 
-    package_type: NotImplemented
+    packet_type: NotImplemented
 
     def __init_subclass__(cls, **__) -> None:
-        if cls.package_type in _IPACKET_REGISTRY:
+        if cls.packet_type in _IPACKET_REGISTRY:
             raise ValueError(
-                f"Implementation for PackageType {cls.package_type} already exists"
+                f"Implementation for PackageType {cls.packet_type} already exists"
             )
-        _IPACKET_REGISTRY[cls.package_type.value] = cls
+        _IPACKET_REGISTRY[cls.packet_type.value] = cls
 
     def __str__(self) -> str:
         if self.__dict__:
@@ -129,7 +130,7 @@ class ReadRequestPacket(IPacket):
           -------------------------------------------------
     """
 
-    package_type: PacketType = PacketType.READ_REQUEST
+    packet_type: PacketType = PacketType.READ_REQUEST
 
     # ! = network (big-endian)
     structure = "!h{filename_size:d}sc{mode_size:d}sc"
@@ -170,7 +171,7 @@ class ReadRequestPacket(IPacket):
         """Encodes the package into a sendable request. The encoding is always in
         netascii.
         """
-        opcode = self.package_type.value
+        opcode = self.packet_type.value
         filename = encode_netascii(self.filename)
         mode = encode_netascii(self.mode.value)
         structure = self.structure.format(
@@ -180,7 +181,7 @@ class ReadRequestPacket(IPacket):
 
 
 class WriteRequestPacket(ReadRequestPacket):
-    package_type: PacketType = PacketType.WRITE_REQUEST
+    packet_type: PacketType = PacketType.WRITE_REQUEST
 
 
 class DataPacket(IPacket):
@@ -191,7 +192,7 @@ class DataPacket(IPacket):
      ----------------------------------
     """
 
-    package_type: PacketType = PacketType.DATA
+    packet_type: PacketType = PacketType.DATA
     max_block_size = 512
 
     def __init__(
@@ -213,7 +214,7 @@ class DataPacket(IPacket):
         return len(self.raw_data) < self.max_block_size
 
     def data(self) -> bytes:
-        result = struct.pack("!hh", self.package_type.value, self.block_number)
+        result = struct.pack("!hh", self.packet_type.value, self.block_number)
         result += self.raw_data
         return result
 
@@ -235,7 +236,7 @@ class AckPacket(IPacket):
      ---------------------
     """
 
-    package_type: PacketType = PacketType.ACKNOWLEDGEMENT
+    packet_type: PacketType = PacketType.ACKNOWLEDGEMENT
 
     def __init__(self, block_number: int) -> None:
         self.block_number = block_number
@@ -251,7 +252,7 @@ class AckPacket(IPacket):
         return instance
 
     def data(self) -> bytes:
-        result = struct.pack("!hh", self.package_type.value, self.block_number)
+        result = struct.pack("!hh", self.packet_type.value, self.block_number)
         return result
 
 
@@ -263,7 +264,7 @@ class ErrorPacket(IPacket):
      -----------------------------------------
     """
 
-    package_type = PacketType.ERROR
+    packet_type = PacketType.ERROR
     structure = "!hh{error_message_size:d}sc"
 
     def __init__(self, error_code: int, error_message: str) -> None:
@@ -276,7 +277,7 @@ class ErrorPacket(IPacket):
             self.error = None
 
     def data(self) -> bytes:
-        opcode = self.package_type.value
+        opcode = self.packet_type.value
         error_message = encode_netascii(self.error_message)
         structure = self.structure.format(error_message_size=len(error_message))
         return struct.pack(structure, opcode, self.error_code, error_message, NUL)
@@ -345,10 +346,10 @@ class TftpPacketClient:
     def read_packet(packet: bytes) -> IPacket:
         opcode_bytes = packet[:2]
         opcode_int = int.from_bytes(opcode_bytes, "big")
-        package_type = PacketType(opcode_int)
-        package_class = package_type.implementation
+        packet_type = PacketType(opcode_int)
+        package_class = packet_type.implementation
         if package_class is None:
-            raise ValueError(f"No implementation found for {package_type}")
+            raise ValueError(f"No implementation found for {packet_type}")
 
         instance = package_class.from_data(packet)
         return instance
@@ -522,7 +523,7 @@ class TftpClient:
                 raise ProtocolException(f"[{packet.error_code}] {packet.error_message}")
             else:
                 raise ProtocolException(
-                    f"Expected Ack or Err, received {packet.package_type.name}"
+                    f"Expected Ack or Err, received {packet.packet_type.name}"
                 )
 
             if data_packet is not None and data_packet.end_of_data:
@@ -544,8 +545,8 @@ class TftpClient:
     def _check_data_packet(packet: IPacket, block_number: int) -> DataPacket:
         if not isinstance(packet, DataPacket):
             raise ProtocolException(
-                f"Expected {DataPacket.package_type.name}, "
-                f"got {packet.package_type.name}"
+                f"Expected {DataPacket.packet_type.name}, "
+                f"got {packet.packet_type.name}"
             )
 
         if packet.block_number < block_number:
@@ -562,47 +563,227 @@ class TftpClient:
         return packet
 
 
-class TftpServer:
-    def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
-        self.listen_addr = listen_addr
-        self.listen_port = listen_port
-        self.running = False
-        self.sock = None
+class Resource(ABC):
+    def __init__(self):
+        self.is_open = False
 
-    def start(self) -> None:
-        self.running = True
+    @abstractmethod
+    def close(self) -> None:
+        self.is_open = False
 
-        logger.info("Initializing socket")
-        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.listen_addr, self.listen_port))
+    @abstractmethod
+    def open(self) -> None:
+        self.is_open = True
 
-        # TODO handle multiple clients simulataneously --- sepearate state machines
 
-        while self.running:
-            # TODO generalize with TftpPacketClient
-            with ctrl_cancel_async_io(self.sock.fileno()):
-                try:
-                    data, (client_ip, client_port) = self.sock.recvfrom(516)
-                    logger.debug("Received data from %s:%d", client_ip, client_port)
-                except KeyboardInterrupt:
-                    logger.error("Keyboard interrupt detected, exiting")
-                    raise
+class FileResource(Resource):
+    def __init__(self, filepath: PathLike, mode: str) -> None:
+        super().__init__()
+        self.filepath = filepath
+        self.mode = mode
+        self.file_handle: io.TextIOWrapper = None
 
-            logger.info("Processing server response")
-            packet = TftpPacketClient.read_packet(data)
+    def close(self) -> None:
+        self.file_handle.close()
 
-            if isinstance(packet, ReadRequestPacket):
-                pass
-            elif isinstance(packet, WriteRequestPacket):
-                pass
+    def open(self) -> None:
+        self.file_handle = to_path(self.filepath).open(self.mode)
+
+
+class ResourceManager:
+
+    __slots__ = ("_resources",)
+
+    def __init__(self, client_addr) -> None:
+        self._resources = {}
+
+    def get(self, resource_id: str) -> Optional[Resource]:
+        return self._resources.get(resource_id)
+
+    def put(self, resource: Resource, resource_id: str) -> None:
+        self._resources[resource_id] = resource
+
+    def close(self) -> None:
+        for resource in self._resources.values():
+            if resource.is_open:
+                resource.close()
+
+
+class TftpServerState(ABC):
+    def __init__(self, resource_manager: ResourceManager, packet: IPacket) -> None:
+        self.resource_manager = resource_manager
+        self.packet = packet
+
+    def __str__(self) -> str:
+        return f"<{self.__class__.__name__}>"
+
+    @abstractmethod
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        """Run the state, i.e. return some response to the client."""
+
+    @abstractmethod
+    def next(self, packet: IPacket) -> TftpServerState:
+        """Transition to next server state."""
+
+
+class ErrorServerState(TftpServerState):
+    def __init__(
+        self,
+        resource_manager: ResourceManager,
+        packet: IPacket,
+        error_code: ErrorCodes,
+        message: str = None,
+    ) -> None:
+        super().__init__(resource_manager, packet)
+        self.packet = ErrorPacket(
+            error_code=error_code.value,
+            error_message=message if message is not None else error_code.name,
+        )
+
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        sock.sendto(self.packet.data(), client_addr)
+        self.resource_manager.close()
+
+    def next(self, packet: IPacket) -> TftpServerState:
+        pass
+
+
+class ReadRequestServerState(TftpServerState):
+
+    resource_id = "RRQ"
+
+    def __init__(
+        self,
+        resource_manager: ResourceManager,
+        packet: ReadRequestPacket,
+    ) -> None:
+        super().__init__(resource_manager, packet)
+        self.block_number = 1
+        self.mode = packet.mode
+        if self.mode is TransferMode.NETASCII:
+            self.file_resource = FileResource(packet.filename, mode="rt")
+        else:
+            self.file_resource = FileResource(packet.filename, mode="rb")
+        self.resource_manager.put(self.file_resource, self.resource_id)
+        self.file_resource.open()
+        self.end_of_data = False
+
+    def __str__(self) -> str:
+        return f"<{self.__class__.__name__} (block {self.block_number:d})>"
+
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        raw_data = self.file_resource.file_handle.read(512)
+
+        if len(raw_data) < 512:
+            self.end_of_data = True
+
+        if self.mode is TransferMode.NETASCII:
+            data = encode_netascii(raw_data)
+        else:
+            data = raw_data
+
+        response = DataPacket(self.block_number, data)
+        sock.sendto(response.data(), client_addr)
+
+    def next(self, packet: IPacket) -> TftpServerState:
+        if isinstance(packet, AckPacket):
+            if packet.block_number == self.block_number:
+                if not self.end_of_data:
+                    self.block_number += 1
+                    return self
+                else:
+                    # we have sent the last packet
+                    return FinalServerState(self.resource_manager, self.packet)
+            elif packet.block_number == self.block_number - 1:
+                # we need to resend the packet
+                self.file_resource.file_handle.seek(self.block_number * 512, 0)
+                return self
             else:
-                raise
+                return ErrorServerState(
+                    self.resource_manager,
+                    packet,
+                    ErrorCodes.ILLEGAL_TFTP_OPERATION,
+                )
+        else:
+            return ErrorServerState(
+                self.resource_manager,
+                packet,
+                ErrorCodes.ILLEGAL_TFTP_OPERATION,
+                f"Expected ACK, recevied {packet.packet_type.name}.",
+            )
 
-            self.sock.sendto(AckPacket(0).data(), (client_ip, client_port))
 
-    def stop(self) -> None:
-        self.running = False
-        self.sock.close()
+class FinalServerState(TftpServerState):
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        self.resource_manager.close()
+        logger.info("Finalized connection with %s:%d", *client_addr)
+
+    def next(self, packet: IPacket) -> TftpServerState:
+        raise ProtocolException("Invalid state transition")
+
+
+class InitialServerState(TftpServerState):
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        pass
+
+    def next(self, packet: IPacket) -> TftpServerState:
+        if isinstance(packet, ReadRequestPacket):
+            resource = FileResource(packet.filename, "rt")
+            self.resource_manager.put(resource, "RRQ")
+            return ReadRequestServerState(self.resource_manager, packet)
+        elif isinstance(packet, ReadRequestPacket):
+            pass
+        else:
+            return ErrorServerState(
+                self.resource_manager,
+                packet,
+                ErrorCodes.ILLEGAL_TFTP_OPERATION,
+                f"Expected Read or Write Request, received {packet.packet_type.name}",
+            )
+
+
+class TftpServerStateMachine:
+    def __init__(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        self.sock = sock
+        self.client_addr = client_addr
+        self.resource_manager = ResourceManager(client_addr)
+        self.state = InitialServerState(self.resource_manager, None)
+        self.state.run(self.sock, self.client_addr)
+
+    def close(self) -> None:
+        self.resource_manager.close()
+
+    def run(self, packet) -> None:
+        new_state = self.state.next(packet)
+        logger.debug("State transition: %s -> %s", self.state, new_state)
+        self.state = new_state
+        self.state.run(self.sock, self.client_addr)
+
+
+class TftpServerRequestHandler(socketserver.BaseRequestHandler):
+
+    server: TftpServer
+
+    def handle(self) -> None:
+        data = self.request[0]
+        sock = self.request[1]
+        logger.debug("Data received from %s:%d", *self.client_address)
+        packet = TftpPacketClient.read_packet(data)
+        logger.debug(
+            "%s:%d -> packet type %s", *self.client_address, packet.packet_type.name
+        )
+        if self.server.clients.get(self.client_address) is None:
+            client_state = TftpServerStateMachine(sock, self.client_address)
+            self.server.clients[self.client_address] = client_state
+
+        self.server.clients[self.client_address].run(packet)
+
+
+class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
+    def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
+        self.clients: Dict[Tuple[str, int], TftpServerStateMachine] = {}
+        logger.info("Serving on %s:%d", listen_addr, listen_port)
+        super().__init__((listen_addr, listen_port), TftpServerRequestHandler)
 
 
 def main():
@@ -616,6 +797,8 @@ def main():
     # TftpClient("127.0.0.1").write_file(
     #     "file3.txt", "Hey World, Where You Goin", mode=TransferMode.NETASCII
     # )
+    with TftpServer() as server:
+        server.serve_forever()
 
 
 if __name__ == "__main__":

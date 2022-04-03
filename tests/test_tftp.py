@@ -20,7 +20,7 @@ class MockPacketType(Enum):
 
 class MockPacket(tftp.IPacket):
 
-    package_type = MockPacketType.MOCK
+    packet_type = MockPacketType.MOCK
 
     def __init__(self, data: bytes) -> None:
         self._data = data
