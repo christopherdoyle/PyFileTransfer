@@ -563,54 +563,52 @@ class TftpClient:
         return packet
 
 
-class Resource(ABC):
+class ServerFileResourceManager:
+    # TODO handle file permissions at this level
+    # TODO handle separate sessions reading/writing to same files
+
+    __slots__ = ("_session_managers",)
+
     def __init__(self):
-        self.is_open = False
+        self._session_managers = {}
 
-    @abstractmethod
-    def close(self) -> None:
-        self.is_open = False
+    def get(self, client_addr) -> SessionFileResourceManager:
+        if client_addr not in self._session_managers:
+            instance = SessionFileResourceManager()
+            self._session_managers[client_addr] = instance
+        else:
+            instance = self._session_managers[client_addr]
 
-    @abstractmethod
-    def open(self) -> None:
-        self.is_open = True
+        return instance
+
+    def close(self, client_addr=None) -> None:
+        if client_addr is not None:
+            logger.debug("Closing Resource Manager for %s:%d", *client_addr)
+            self._session_managers[client_addr].close()
+            del self._session_managers[client_addr]
+        else:
+            for client_addr in self._session_managers.keys():
+                logger.debug("Closing Resource Manager for %s:%d", *client_addr)
+                self._session_managers[client_addr].close()
+                del self._session_managers[client_addr]
 
 
-class FileResource(Resource):
-    def __init__(self, filepath: PathLike, mode: str) -> None:
-        super().__init__()
-        self.filepath = filepath
-        self.mode = mode
+class SessionFileResourceManager:
+    def __init__(self) -> None:
         self.file_handle: io.TextIOWrapper = None
 
-    def close(self) -> None:
-        self.file_handle.close()
-
-    def open(self) -> None:
-        self.file_handle = to_path(self.filepath).open(self.mode)
-
-
-class ResourceManager:
-
-    __slots__ = ("_resources",)
-
-    def __init__(self, client_addr) -> None:
-        self._resources = {}
-
-    def get(self, resource_id: str) -> Optional[Resource]:
-        return self._resources.get(resource_id)
-
-    def put(self, resource: Resource, resource_id: str) -> None:
-        self._resources[resource_id] = resource
+    def open(self, filepath: PathLike, mode: str) -> None:
+        self.file_handle = to_path(filepath).open(mode)
 
     def close(self) -> None:
-        for resource in self._resources.values():
-            if resource.is_open:
-                resource.close()
+        if self.file_handle is not None:
+            self.file_handle.close()
 
 
 class TftpServerState(ABC):
-    def __init__(self, resource_manager: ResourceManager, packet: IPacket) -> None:
+    def __init__(
+        self, resource_manager: SessionFileResourceManager, packet: IPacket
+    ) -> None:
         self.resource_manager = resource_manager
         self.packet = packet
 
@@ -629,7 +627,7 @@ class TftpServerState(ABC):
 class ErrorServerState(TftpServerState):
     def __init__(
         self,
-        resource_manager: ResourceManager,
+        resource_manager: SessionFileResourceManager,
         packet: IPacket,
         error_code: ErrorCodes,
         message: str = None,
@@ -654,25 +652,23 @@ class ReadRequestServerState(TftpServerState):
 
     def __init__(
         self,
-        resource_manager: ResourceManager,
+        resource_manager: SessionFileResourceManager,
         packet: ReadRequestPacket,
     ) -> None:
         super().__init__(resource_manager, packet)
         self.block_number = 1
         self.mode = packet.mode
         if self.mode is TransferMode.NETASCII:
-            self.file_resource = FileResource(packet.filename, mode="rt")
+            self.resource_manager.open(packet.filename, mode="rt")
         else:
-            self.file_resource = FileResource(packet.filename, mode="rb")
-        self.resource_manager.put(self.file_resource, self.resource_id)
-        self.file_resource.open()
+            self.resource_manager.open(packet.filename, mode="rb")
         self.end_of_data = False
 
     def __str__(self) -> str:
         return f"<{self.__class__.__name__} (block {self.block_number:d})>"
 
     def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
-        raw_data = self.file_resource.file_handle.read(512)
+        raw_data = self.resource_manager.file_handle.read(512)
 
         if len(raw_data) < 512:
             self.end_of_data = True
@@ -696,7 +692,7 @@ class ReadRequestServerState(TftpServerState):
                     return FinalServerState(self.resource_manager, self.packet)
             elif packet.block_number == self.block_number - 1:
                 # we need to resend the packet
-                self.file_resource.file_handle.seek(self.block_number * 512, 0)
+                self.resource_manager.file_handle.seek(self.block_number * 512, 0)
                 return self
             else:
                 return ErrorServerState(
@@ -728,8 +724,6 @@ class InitialServerState(TftpServerState):
 
     def next(self, packet: IPacket) -> TftpServerState:
         if isinstance(packet, ReadRequestPacket):
-            resource = FileResource(packet.filename, "rt")
-            self.resource_manager.put(resource, "RRQ")
             return ReadRequestServerState(self.resource_manager, packet)
         elif isinstance(packet, ReadRequestPacket):
             pass
@@ -743,10 +737,15 @@ class InitialServerState(TftpServerState):
 
 
 class TftpServerStateMachine:
-    def __init__(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+    def __init__(
+        self,
+        sock: socket.socket,
+        client_addr: Tuple[str, int],
+        server_resource_manager: ServerFileResourceManager,
+    ) -> None:
         self.sock = sock
         self.client_addr = client_addr
-        self.resource_manager = ResourceManager(client_addr)
+        self.resource_manager = server_resource_manager.get(client_addr)
         self.state = InitialServerState(self.resource_manager, None)
         self.state.run(self.sock, self.client_addr)
 
@@ -772,16 +771,25 @@ class TftpServerRequestHandler(socketserver.BaseRequestHandler):
         logger.debug(
             "%s:%d -> packet type %s", *self.client_address, packet.packet_type.name
         )
+
+        client_state = self.server.clients.get(self.client_address)
         if self.server.clients.get(self.client_address) is None:
-            client_state = TftpServerStateMachine(sock, self.client_address)
+            client_state = TftpServerStateMachine(
+                sock, self.client_address, self.server.resource_manager
+            )
             self.server.clients[self.client_address] = client_state
 
-        self.server.clients[self.client_address].run(packet)
+        client_state.run(packet)
+        if isinstance(client_state.state, FinalServerState):
+            client_state.close()
+            del self.server.clients[self.client_address]
+            self.server.resource_manager.close(self.client_address)
 
 
 class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
         self.clients: Dict[Tuple[str, int], TftpServerStateMachine] = {}
+        self.resource_manager = ServerFileResourceManager()
         logger.info("Serving on %s:%d", listen_addr, listen_port)
         super().__init__((listen_addr, listen_port), TftpServerRequestHandler)
 
