@@ -14,6 +14,7 @@ import logging
 import socket
 import socketserver
 import struct
+import sys
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -390,7 +391,7 @@ class TftpClient:
         fh = None
         try:
             fh = local_filepath.open(mode=file_mode)
-            for packet in self._read(remote_filename=remote_filename, mode=mode):
+            for packet in self._read(remote_filename=str(remote_filename), mode=mode):
                 fh.write(decode(packet.raw_data))
         finally:
             if fh is not None:
@@ -794,20 +795,104 @@ class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         super().__init__((listen_addr, listen_port), TftpServerRequestHandler)
 
 
-def main():
-    UserLogger().add_stderr(logging.DEBUG)
-    # print(
-    #     TftpClient("127.0.0.1").read_file("file.txt", mode=TransferMode.OCTET).read()
-    # )
-    # TftpClient("127.0.0.1").upload_file(
-    #     "file2.txt", "file.txt", mode=TransferMode.OCTET
-    # )
-    # TftpClient("127.0.0.1").write_file(
-    #     "file3.txt", "Hey World, Where You Goin", mode=TransferMode.NETASCII
-    # )
-    with TftpServer() as server:
-        server.serve_forever()
+def _parse_user_args():
+    import argparse
+
+    from .util import cli
+    from .util.io import parse_path
+
+    argument_parser = argparse.ArgumentParser(
+        prog="pyfiletransfer.tftp",
+        description="Trivial File Transfer Protocol (TFTP) client and server.",
+    )
+
+    subcommands = argument_parser.add_subparsers(
+        title="command", dest="command", required=True
+    )
+    client_parser = subcommands.add_parser("client", help="TFTP Client")
+    server_parser = subcommands.add_parser("server", help="TFTP Server")
+    cli.add_verbose(client_parser)
+    cli.add_verbose(server_parser)
+
+    client_parser.add_argument(
+        "-s",
+        "--server",
+        type=str,
+        help="IP or hostname of remote TFTP server.",
+    )
+    client_parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=69,
+        help="Port of remote TFTP server.",
+    )
+    client_parser.add_argument(
+        "-m",
+        "--mode",
+        default=TransferMode.NETASCII,
+        help="Transfer mode.",
+        type=TransferMode,
+        action=cli.EnumAction,
+    )
+    client_actions = client_parser.add_mutually_exclusive_group()
+    client_actions.add_argument(
+        "-d",
+        "--download",
+        help="Download file from remote server. First argument is the remote filepath, "
+        "second argument is the local filepath.",
+        nargs=2,
+        metavar=("REMOTE", "LOCAL"),
+        type=parse_path,
+    )
+    client_actions.add_argument(
+        "-u",
+        "--upload",
+        help="Upload file to remote server. First argument is the local filepath, "
+        "second argument is the remote filepath.",
+        nargs=2,
+        metavar=("LOCAL", "REMOTE"),
+        type=parse_path,
+    )
+
+    server_parser.add_argument(
+        "-l",
+        "--listen",
+        help="IP address or hostname to listen on. By default binds to all.",
+        default="0.0.0.0",
+        type=str,
+    )
+    server_parser.add_argument(
+        "-p", "--port", help="Port to listen on.", type=int, default=69
+    )
+
+    parsed_args = argument_parser.parse_args()
+
+    UserLogger().add_stderr(logging.DEBUG if parsed_args.verbose else logging.INFO)
+
+    if parsed_args.command == "client":
+        client = TftpClient(parsed_args.server)
+
+        if parsed_args.download is not None:
+            remote, local = parsed_args.download
+            logger.debug("Downloading %s -> %s", remote, local)
+            client.download_file(remote, local, mode=parsed_args.mode)
+        else:
+            local, remote = parsed_args.upload
+            logger.debug("Uploading %s -> %s", local, remote)
+            client.upload_file(remote, local, mode=parsed_args.mode)
+    elif parsed_args.command == "server":
+        with TftpServer(parsed_args.listen, parsed_args.port) as server:
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                logger.error("KeyboardInterrupt detected, exiting")
+                sys.exit(1)
+    else:
+        raise argparse.ArgumentError(
+            parsed_args.command, f"Unrecognized command {parsed_args.command}"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    _parse_user_args()
