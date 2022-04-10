@@ -184,6 +184,12 @@ class ReadRequestPacket(IPacket):
 class WriteRequestPacket(ReadRequestPacket):
     packet_type: PacketType = PacketType.WRITE_REQUEST
 
+    @classmethod
+    def from_data(cls, data: bytes) -> WriteRequestPacket:
+        rrq = super().from_data(data)
+        wrq = WriteRequestPacket(filename=rrq.filename, mode=rrq.mode)
+        return wrq
+
 
 class DataPacket(IPacket):
     """
@@ -357,8 +363,8 @@ class TftpPacketClient:
 
 
 class TftpClient:
-    def __init__(self, server_ip: str) -> None:
-        self.packet_client = TftpPacketClient(server_ip)
+    def __init__(self, server_ip: str, server_port: int = 69) -> None:
+        self.packet_client = TftpPacketClient(server_ip, server_port)
 
     def download_file(
         self,
@@ -436,7 +442,9 @@ class TftpClient:
         try:
             fh = open(local_filepath, mode="r" + file_mode)
             self._write(
-                remote_filename, map(encode, iter(partial(fh.read, 512), b"")), mode
+                str(remote_filename),
+                map(encode, iter(partial(fh.read, 512), b"")),
+                mode,
             )
         finally:
             if fh is not None:
@@ -466,7 +474,7 @@ class TftpClient:
             encode = identity
 
         self._write(
-            remote_filename, map(encode, iter(partial(data.read, 512), b"")), mode
+            str(remote_filename), map(encode, iter(partial(data.read, 512), b"")), mode
         )
 
     def _read(
@@ -507,6 +515,7 @@ class TftpClient:
     ) -> None:
         self.packet_client.connect()
         wrq = WriteRequestPacket(filename=remote_filename, mode=mode)
+        logger.debug("Sending %s packet", wrq.packet_type.name)
         self.packet_client.send(wrq)
 
         # first response should be Ack with block number 0
@@ -648,9 +657,6 @@ class ErrorServerState(TftpServerState):
 
 
 class ReadRequestServerState(TftpServerState):
-
-    resource_id = "RRQ"
-
     def __init__(
         self,
         resource_manager: SessionFileResourceManager,
@@ -710,8 +716,95 @@ class ReadRequestServerState(TftpServerState):
             )
 
 
-class FinalServerState(TftpServerState):
+class WriteRequestServerState(TftpServerState):
+    """Session state for a Write request. Client has sent a filepath in the initial
+    request, we need to check the filepath and either return an Error or an Ack. We then
+    expect N Data packets until a packet smaller than 512 bytes, at which point we send
+    the last Ack and the session is over.
+    """
+
+    def __init__(
+        self,
+        resource_manager: SessionFileResourceManager,
+        packet: WriteRequestPacket,
+    ) -> None:
+        super().__init__(resource_manager, packet)
+        self.block_number = 0
+        self.mode = packet.mode
+        if self.mode is TransferMode.NETASCII:
+            self.resource_manager.open(packet.filename, mode="wt")
+        else:
+            self.resource_manager.open(packet.filename, mode="wb")
+        self.end_of_data = False
+
+    def __str__(self) -> str:
+        return f"<{self.__class__.__name__} (block {self.block_number:d})>"
+
     def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        response = AckPacket(self.block_number)
+        logger.debug(
+            "Sending %s (block %d)", response.packet_type.name, self.block_number
+        )
+        sock.sendto(response.data(), client_addr)
+
+    def next(self, packet: IPacket) -> TftpServerState:
+        if isinstance(packet, DataPacket):
+            if packet.block_number == self.block_number + 1:
+                # client has sent next block
+                if self.mode is TransferMode.NETASCII:
+                    data = decode_netascii(packet.raw_data)
+                else:
+                    data = packet.raw_data
+
+                self.resource_manager.file_handle.write(data)
+                self.block_number += 1
+
+                if len(data) < 256:
+                    # end of data, but we still need to send an ACK
+                    return FinalServerState(
+                        self.resource_manager,
+                        self.packet,
+                        final_word=AckPacket(self.block_number),
+                    )
+                else:
+                    return self
+            elif packet.block_number == self.block_number:
+                # client has resent data packet, probably they did not receive ack,
+                # resend ack with block number
+                return self
+            elif packet.block_number > self.block_number + 1:
+                # we have missed a datapacket, resent ack with block number
+                return self
+            else:
+                # client has resent packet less than previous, bad behavior
+                return ErrorServerState(
+                    self.resource_manager,
+                    packet,
+                    ErrorCodes.ILLEGAL_TFTP_OPERATION,
+                )
+        else:
+            return ErrorServerState(
+                self.resource_manager,
+                packet,
+                ErrorCodes.ILLEGAL_TFTP_OPERATION,
+                f"Expected DATA, recevied {packet.packet_type.name}.",
+            )
+
+
+class FinalServerState(TftpServerState):
+    def __init__(
+        self,
+        resource_manager: SessionFileResourceManager,
+        packet: IPacket,
+        final_word: IPacket = None,
+    ) -> None:
+        super().__init__(resource_manager, packet)
+        self.final_word = final_word
+
+    def run(self, sock: socket.socket, client_addr: Tuple[str, int]) -> None:
+        if self.final_word is not None:
+            logger.debug("Sending final word %s", self.final_word)
+            sock.sendto(self.final_word.data(), client_addr)
         self.resource_manager.close()
         logger.info("Finalized connection with %s:%d", *client_addr)
 
@@ -724,10 +817,10 @@ class InitialServerState(TftpServerState):
         pass
 
     def next(self, packet: IPacket) -> TftpServerState:
-        if isinstance(packet, ReadRequestPacket):
-            return ReadRequestServerState(self.resource_manager, packet)
+        if isinstance(packet, WriteRequestPacket):
+            return WriteRequestServerState(self.resource_manager, packet)
         elif isinstance(packet, ReadRequestPacket):
-            pass
+            return ReadRequestServerState(self.resource_manager, packet)
         else:
             return ErrorServerState(
                 self.resource_manager,
@@ -791,8 +884,9 @@ class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
         self.clients: Dict[Tuple[str, int], TftpServerStateMachine] = {}
         self.resource_manager = ServerFileResourceManager()
-        logger.info("Serving on %s:%d", listen_addr, listen_port)
         super().__init__((listen_addr, listen_port), TftpServerRequestHandler)
+        listen_addr_, listen_port_ = self.socket.getsockname()
+        logger.info("Serving on %s:%d", listen_addr_, listen_port_)
 
 
 def _parse_user_args():
@@ -819,6 +913,7 @@ def _parse_user_args():
         "--server",
         type=str,
         help="IP or hostname of remote TFTP server.",
+        required=True,
     )
     client_parser.add_argument(
         "-p",
@@ -835,7 +930,7 @@ def _parse_user_args():
         type=TransferMode,
         action=cli.EnumAction,
     )
-    client_actions = client_parser.add_mutually_exclusive_group()
+    client_actions = client_parser.add_mutually_exclusive_group(required=True)
     client_actions.add_argument(
         "-d",
         "--download",

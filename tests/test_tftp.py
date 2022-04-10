@@ -2,6 +2,7 @@ from __future__ import annotations
 import socket
 import threading
 from enum import Enum
+from pathlib import Path
 from queue import Queue
 from typing import Type
 
@@ -195,3 +196,33 @@ class TestTftpPacketClient:
         assert result is not None
         assert result[0] == b"HOT BUTTER"
         assert result[1] == ("127.0.0.1", client.client_port)
+
+
+class TestClientServerIntegration:
+    def test(self) -> None:
+        expected = "Hello World"
+        test_filepath = Path("test.txt")
+        test_filepath.unlink(missing_ok=True)
+
+        server = tftp.TftpServer("127.0.0.1", 0)
+        server_thread = threading.Thread(
+            target=server.serve_forever, name="Thread-Server"
+        )
+        server_thread.daemon = True
+        server_thread.start()
+
+        client = tftp.TftpClient(*server.socket.getsockname())
+        client_thread = threading.Thread(
+            target=client.write_file,
+            kwargs=dict(remote_filename=str(test_filepath), data=expected),
+            name="Thread-Client",
+        )
+        client_thread.daemon = True
+        client_thread.start()
+
+        client_thread.join()
+        server.shutdown()
+        server_thread.join()
+
+        actual = test_filepath.read_text()
+        assert expected == actual
