@@ -1,8 +1,8 @@
 from __future__ import annotations
+
 import socket
 import threading
 from enum import Enum
-from pathlib import Path
 from queue import Queue
 from typing import Type
 
@@ -199,12 +199,11 @@ class TestTftpPacketClient:
 
 
 class TestClientServerIntegration:
-    def test(self) -> None:
+    def test(self, tmp_path) -> None:
         expected = "Hello World"
-        test_filepath = Path("test.txt")
-        test_filepath.unlink(missing_ok=True)
+        test_filename = "test.txt"
 
-        server = tftp.TftpServer("127.0.0.1", 0)
+        server = tftp.TftpServer("127.0.0.1", 0, tmp_path)
         server_thread = threading.Thread(
             target=server.serve_forever, name="Thread-Server"
         )
@@ -214,7 +213,7 @@ class TestClientServerIntegration:
         client = tftp.TftpClient(*server.socket.getsockname())
         client_thread = threading.Thread(
             target=client.write_file,
-            kwargs=dict(remote_filename=str(test_filepath), data=expected),
+            kwargs=dict(remote_filename=test_filename, data=expected),
             name="Thread-Client",
         )
         client_thread.daemon = True
@@ -222,7 +221,6 @@ class TestClientServerIntegration:
 
         client_thread.join()
         server.shutdown()
-        server_thread.join()
 
-        actual = test_filepath.read_text()
+        actual = (tmp_path / test_filename).read_text()
         assert expected == actual

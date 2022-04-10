@@ -42,3 +42,16 @@ def ctrl_cancel_async_io(file_handle):
     finally:
         kernel32.SetConsoleCtrlHandler(ctrl_handler, False)
         kernel32.CloseHandle(hthread)
+
+
+def get_win_folder():
+    buffer = ctypes.create_unicode_buffer(1024)
+    # https://docs.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetfolderpatha
+    ctypes.windll.shell32.SHGetFolderPathW(
+        None,
+        26,  # APPDATA
+        None,
+        0,
+        buffer,
+    )
+    return buffer.value

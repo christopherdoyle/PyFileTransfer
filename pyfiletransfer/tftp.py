@@ -19,11 +19,12 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import partial
+from pathlib import Path
 from typing import Dict, Type, Optional, Union, Iterator, Tuple
 
 from .util.func import identity
 from .util.logging import UserLogger
-from .util.io import PathLike, to_path
+from .util.io import PathLike, to_path, user_data_directory
 from .util.nt import ctrl_cancel_async_io
 
 logger = logging.getLogger(__name__)
@@ -577,14 +578,19 @@ class ServerFileResourceManager:
     # TODO handle file permissions at this level
     # TODO handle separate sessions reading/writing to same files
 
-    __slots__ = ("_session_managers",)
+    __slots__ = (
+        "_root_dir",
+        "_session_managers",
+    )
 
-    def __init__(self):
+    def __init__(self, root_dir: Path) -> None:
+        self._root_dir = root_dir.resolve()
+        self._root_dir.mkdir(parents=True, exist_ok=True)
         self._session_managers = {}
 
     def get(self, client_addr) -> SessionFileResourceManager:
         if client_addr not in self._session_managers:
-            instance = SessionFileResourceManager()
+            instance = SessionFileResourceManager(self._root_dir)
             self._session_managers[client_addr] = instance
         else:
             instance = self._session_managers[client_addr]
@@ -604,11 +610,19 @@ class ServerFileResourceManager:
 
 
 class SessionFileResourceManager:
-    def __init__(self) -> None:
-        self.file_handle: io.TextIOWrapper = None
+
+    __slots__ = ("_root_dir", "file_handle")
+
+    def __init__(self, root_dir: Path) -> None:
+        self._root_dir = root_dir
+        self.file_handle: Optional[io.TextIOWrapper] = None
 
     def open(self, filepath: PathLike, mode: str) -> None:
-        self.file_handle = to_path(filepath).open(mode)
+        full_filepath = self._root_dir / to_path(filepath)
+        if self._root_dir not in full_filepath.parents:
+            raise IOError(f"Filepath '{filepath}' transcends root")
+
+        self.file_handle = full_filepath.open(mode)
 
     def close(self) -> None:
         if self.file_handle is not None:
@@ -881,9 +895,14 @@ class TftpServerRequestHandler(socketserver.BaseRequestHandler):
 
 
 class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
-    def __init__(self, listen_addr: str = "0.0.0.0", listen_port: int = 69) -> None:
+    def __init__(
+        self,
+        listen_addr: str = "0.0.0.0",
+        listen_port: int = 69,
+        data_directory: Path = Path("."),
+    ) -> None:
         self.clients: Dict[Tuple[str, int], TftpServerStateMachine] = {}
-        self.resource_manager = ServerFileResourceManager()
+        self.resource_manager = ServerFileResourceManager(data_directory)
         super().__init__((listen_addr, listen_port), TftpServerRequestHandler)
         listen_addr_, listen_port_ = self.socket.getsockname()
         logger.info("Serving on %s:%d", listen_addr_, listen_port_)
@@ -892,6 +911,7 @@ class TftpServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
 def _parse_user_args():
     import argparse
 
+    from . import VENDOR, APPLICATION_NAME
     from .util import cli
     from .util.io import parse_path
 
@@ -960,6 +980,13 @@ def _parse_user_args():
     server_parser.add_argument(
         "-p", "--port", help="Port to listen on.", type=int, default=69
     )
+    server_parser.add_argument(
+        "-d",
+        "--data_dir",
+        help="Directory to use a ROOT TFTP directory",
+        type=parse_path,
+        default=user_data_directory(VENDOR, APPLICATION_NAME) / "data",
+    )
 
     parsed_args = argument_parser.parse_args()
 
@@ -977,7 +1004,9 @@ def _parse_user_args():
             logger.debug("Uploading %s -> %s", local, remote)
             client.upload_file(remote, local, mode=parsed_args.mode)
     elif parsed_args.command == "server":
-        with TftpServer(parsed_args.listen, parsed_args.port) as server:
+        with TftpServer(
+            parsed_args.listen, parsed_args.port, data_directory=parsed_args.data_dir
+        ) as server:
             try:
                 server.serve_forever()
             except KeyboardInterrupt:
